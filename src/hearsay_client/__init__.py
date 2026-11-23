@@ -1,0 +1,53 @@
+"""A client for Hearsay's wire contract. It imports nothing from the service and is built against the contract alone."""
+
+from hearsay_client.client import (
+    CONTRACT_VERSION,
+    ContractMismatchError,
+    HearsayClient,
+    HearsayError,
+    RetryPolicy,
+    check_handshake,
+)
+from hearsay_client.types import (
+    Document,
+    Fetch,
+    FetchTold,
+    Handshake,
+    KeptDocument,
+    MyFetch,
+    Reader,
+    Search,
+    SearchesSeen,
+    SearchResult,
+    SearchTold,
+    SeenSearch,
+    ServedContract,
+    Stamp,
+    UrlSeen,
+    Witness,
+)
+
+__all__ = [
+    "CONTRACT_VERSION",
+    "ContractMismatchError",
+    "Document",
+    "Fetch",
+    "FetchTold",
+    "Handshake",
+    "HearsayClient",
+    "HearsayError",
+    "KeptDocument",
+    "MyFetch",
+    "Reader",
+    "RetryPolicy",
+    "Search",
+    "SearchResult",
+    "SearchTold",
+    "SearchesSeen",
+    "SeenSearch",
+    "ServedContract",
+    "Stamp",
+    "UrlSeen",
+    "Witness",
+    "check_handshake",
+]

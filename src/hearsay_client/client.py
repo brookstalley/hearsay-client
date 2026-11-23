@@ -1,0 +1,391 @@
+"""The Hearsay client: the startup handshake, typed tells and look-ups, and capped retries (`api-contract.md`).
+
+Open it with :meth:`HearsayClient.connect`, or as an async context manager, which calls it. The handshake fails at
+startup, before any data call, when the service does not serve this client's contract major, serves it at an older
+minor, or belongs to another environment than the one the client was configured for (handoff #5, #4).
+
+A failure is raised, never turned into an empty answer: a timeout, an unreachable service or a 5xx means there is
+no stored result, not that the store holds nothing. A service that does not answer fails the call at once, so a
+caller looking up before a fetch carries on without reuse rather than waiting out retries; a tell that fails is the
+caller's to queue.
+"""
+
+import asyncio
+import logging
+import random
+import re
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Any, Self
+
+import httpx
+
+from hearsay_client.types import (
+    Fetch,
+    FetchTold,
+    Handshake,
+    KeptDocument,
+    MyFetch,
+    Reader,
+    Search,
+    SearchesSeen,
+    SearchTold,
+    SeenSearch,
+    ServedContract,
+    Stamp,
+    UrlSeen,
+    Witness,
+)
+
+log = logging.getLogger(__name__)
+
+#: The contract version this client is built against. It is sent on every call but the handshake.
+CONTRACT_VERSION = "0.1"
+
+CONTRACT_HEADER = "Hearsay-Contract"
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+
+_VERSION = re.compile(r"(\d+)\.(\d+)")
+
+
+class HearsayError(Exception):
+    """A call failed. ``code`` is the contract's error code, or ``unreachable`` when no answer came back.
+
+    :ivar status: the HTTP status, or None when no answer came back
+    :ivar retryable: whether the contract says the call may be tried again
+    :ivar request_id: the id the service gave the call, for its operator's logs
+    :ivar errors: each failing field's path and code
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int | None = None,
+        error_class: str | None = None,
+        retryable: bool = False,
+        request_id: str | None = None,
+        errors: list[tuple[str, str]] | None = None,
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.status = status
+        self.error_class = error_class
+        self.retryable = retryable
+        self.request_id = request_id
+        self.errors = errors or []
+
+
+class ContractMismatchError(HearsayError):
+    """The service cannot serve this client: another environment, or no contract version this client can use."""
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """How a failed idempotent call is tried again: one wait before each retry, so ``waits`` also caps their
+    number. Each wait is stretched by up to ``jitter`` of itself, and is never shorter than a ``Retry-After``."""
+
+    waits: tuple[float, ...] = (0.2, 1.0, 5.0)
+    jitter: float = 0.25
+
+
+def _version(text: str) -> tuple[int, int]:
+    matched = _VERSION.fullmatch(text)
+    if matched is None:
+        raise ValueError(f"{text!r} is not a MAJOR.MINOR contract version")
+    return int(matched[1]), int(matched[2])
+
+
+def check_handshake(handshake: Handshake, *, contract: str, environment: str) -> ServedContract:
+    """The served contract this client will use, or why it cannot use any.
+
+    :raises ContractMismatchError: the service is not Hearsay, is in another environment, does not serve the
+        client's major, or serves it at a minor older than the client's
+    """
+    if handshake.service != "hearsay":
+        raise ContractMismatchError("contract_unsupported", f"the service is {handshake.service!r}, not hearsay")
+    if handshake.environment != environment:
+        raise ContractMismatchError(
+            "contract_unsupported",
+            f"the service is in environment {handshake.environment!r}, and this client was configured for "
+            f"{environment!r}",
+        )
+    major, minor = _version(contract)
+    same_major = [served for served in handshake.contracts if _version(served.version)[0] == major]
+    offered = ", ".join(served.version for served in handshake.contracts) or "nothing"
+    if not same_major:
+        raise ContractMismatchError(
+            "contract_unsupported", f"the service serves {offered}, and this client is built for {contract}"
+        )
+    newest = max(same_major, key=lambda served: _version(served.version)[1])
+    if _version(newest.version)[1] < minor:
+        raise ContractMismatchError(
+            "contract_unsupported", f"the service serves {newest.version}, older than this client's {contract}"
+        )
+    if newest.status == "deprecated":
+        log.warning("Hearsay contract %s is deprecated, sunset %s", newest.version, newest.sunset)
+    return newest
+
+
+def _problem(response: httpx.Response) -> HearsayError:
+    """The error a failed response carries, read as the contract's problem object where it is one."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or "code" not in body:
+        # Not the service's answer, such as a proxy's page. A gateway failure may pass; anything else is not ours.
+        return HearsayError(
+            "unexpected_response",
+            f"HTTP {response.status_code} without a problem object",
+            status=response.status_code,
+            retryable=response.status_code in (502, 503, 504),
+            request_id=response.headers.get("request-id"),
+        )
+    return HearsayError(
+        str(body["code"]),
+        str(body.get("title", "")),
+        status=response.status_code,
+        error_class=body.get("class"),
+        retryable=bool(body.get("retryable", False)),
+        request_id=body.get("request_id"),
+        errors=[(str(error.get("path")), str(error.get("code"))) for error in body.get("errors", [])],
+    )
+
+
+def _retry_after(response: httpx.Response) -> float:
+    value = response.headers.get("retry-after")
+    try:
+        return max(0.0, float(value)) if value is not None else 0.0
+    except ValueError:
+        return 0.0
+
+
+class HearsayClient:
+    """Typed calls to one Hearsay service, as one product (the key names it).
+
+    :param base_url: the service's address
+    :param key: the product's bearer key
+    :param environment: the environment this client is configured for; a service in another one is refused
+    :param http: an HTTP client to call through; one is made, and closed with this client, when none is given
+    :param retry: how failed idempotent calls are tried again
+    :param timeout: seconds before a call with no answer fails, sent with every call, whichever HTTP client is used
+    :param sleep: how the client waits between retries
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        key: str,
+        *,
+        environment: str,
+        http: httpx.AsyncClient | None = None,
+        retry: RetryPolicy | None = None,
+        timeout: float = 10.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._owns_http = http is None
+        self._http = http if http is not None else httpx.AsyncClient()
+        self._timeout = timeout
+        self._base_url = base_url.rstrip("/")
+        self._authorization = {"Authorization": f"Bearer {key}"}
+        self._environment = environment
+        self._retry = retry or RetryPolicy()
+        self._sleep = sleep
+        self.handshake: Handshake | None = None
+
+    async def __aenter__(self) -> Self:
+        try:
+            await self.connect()
+        except BaseException:
+            await self.close()
+            raise
+        return self
+
+    async def __aexit__(
+        self, kind: type[BaseException] | None, error: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._owns_http:
+            await self._http.aclose()
+
+    async def connect(self) -> Handshake:
+        """Call the handshake and check it. Every data call needs it first.
+
+        :raises ContractMismatchError: the service cannot serve this client
+        :raises HearsayError: the handshake itself failed
+        """
+        body = await self._request("GET", "/contract", contract=False)
+        handshake = Handshake.read(body)
+        check_handshake(handshake, contract=CONTRACT_VERSION, environment=self._environment)
+        self.handshake = handshake
+        return handshake
+
+    # --- Readers ---------------------------------------------------------------------------------------------------
+
+    async def register_reader(self, kind: str, name: str, version: str) -> Reader:
+        """Register a reader at a version, or get the one already registered."""
+        body = await self._request("POST", "/readers", json={"kind": kind, "name": name, "version": version})
+        return Reader(body["reader"], body["created"], Stamp.read(body["stamp"]))
+
+    # --- Tells -----------------------------------------------------------------------------------------------------
+
+    async def tell_fetch(self, fetch: Fetch, *, idempotency_key: str | None = None) -> FetchTold:
+        """Keep a fetch. A retry, by this client or a caller passing the same key, stores nothing again."""
+        body = await self._tell("/tell/fetch", fetch.wire(), idempotency_key)
+        return FetchTold(
+            request=body["request"],
+            document=body.get("document"),
+            document_new=body.get("document_new"),
+            replayed=body.get("replayed", False),
+            stamp=Stamp.read(body["stamp"]),
+        )
+
+    async def tell_search(self, search: Search, *, idempotency_key: str | None = None) -> SearchTold:
+        """Keep a search with its results, including none."""
+        body = await self._tell("/tell/search", search.wire(), idempotency_key)
+        return SearchTold(body["event"], body.get("replayed", False), Stamp.read(body["stamp"]))
+
+    async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> dict[str, Any]:
+        # One key for every attempt, so a retry after a lost answer is replayed rather than written twice.
+        key = idempotency_key or str(uuid.uuid4())
+        return await self._request("POST", path, json=body, headers={IDEMPOTENCY_HEADER: key})
+
+    # --- Look-ups --------------------------------------------------------------------------------------------------
+
+    async def lookup_url(
+        self, url: str, *, limit: int | None = None, min_store_state: int | None = None, on_behind: str | None = None
+    ) -> UrlSeen:
+        """Q1: the world's witnesses of ``url`` and this product's own fetches of it, newest first."""
+        body = await self._request(
+            "POST", "/lookup/url", json=_read({"url": url}, limit, min_store_state, on_behind)
+        )
+        return UrlSeen(
+            witnesses=[Witness.read(witness) for witness in body["witnesses"]],
+            mine=[MyFetch.read(mine) for mine in body["mine"]],
+            stamp=Stamp.read(body["stamp"]),
+        )
+
+    async def lookup_search(
+        self,
+        provider: str,
+        query: str,
+        scope: Mapping[str, Any],
+        *,
+        limit: int | None = None,
+        min_store_state: int | None = None,
+        on_behind: str | None = None,
+    ) -> SearchesSeen:
+        """Q2: this product's searches with exactly this provider, query and scope, newest first."""
+        body = await self._request(
+            "POST",
+            "/lookup/search",
+            json=_read(
+                {"provider": provider, "query": query, "scope": dict(scope)}, limit, min_store_state, on_behind
+            ),
+        )
+        return SearchesSeen([SeenSearch.read(seen) for seen in body["searches"]], Stamp.read(body["stamp"]))
+
+    async def document(
+        self,
+        document: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+        min_store_state: int | None = None,
+        on_behind: str | None = None,
+    ) -> KeptDocument:
+        """A kept page's text, or characters ``[start, end)`` of it."""
+        given = (("start", start), ("end", end), ("min_store_state", min_store_state), ("on_behind", on_behind))
+        params = {name: value for name, value in given if value is not None}
+        body = await self._request("GET", f"/documents/{document}", params=params)
+        return KeptDocument(
+            document=body["document"],
+            length=body["length"],
+            start=body["start"],
+            end=body["end"],
+            text=body["text"],
+            mime_type=body.get("mime_type"),
+            stamp=Stamp.read(body["stamp"]),
+        )
+
+    # --- Transport -------------------------------------------------------------------------------------------------
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        contract: bool = True,
+        idempotent: bool = True,
+    ) -> dict[str, Any]:
+        """One call, tried again on a retryable answer while the policy allows, when the call is idempotent. No
+        answer at all is raised at once as ``unreachable``.
+
+        A tell is idempotent through its key, and a read changes nothing, so every call the contract has today
+        is; a call that is not must pass ``idempotent=False`` and is then tried once. An ``internal`` error is
+        tried again once, as the contract allows for idempotent calls.
+        """
+        if contract and self.handshake is None:
+            raise RuntimeError("call connect() first: the handshake checks the service before any data call")
+        sent = dict(self._authorization)
+        if contract:
+            sent[CONTRACT_HEADER] = CONTRACT_VERSION
+        sent.update(headers or {})
+        url = f"{self._base_url}{path}"
+        retried_internal = False
+        attempt = 0
+        while True:
+            try:
+                response = await self._http.request(
+                    method, url, json=json, params=params, headers=sent, timeout=self._timeout
+                )
+            except httpx.TransportError as error:
+                # Not retried: a service that does not answer is failed at once, so the caller can carry on
+                # without reuse (architecture.md, Service down) instead of waiting out every retry's timeout.
+                raise HearsayError("unreachable", f"no answer from Hearsay ({type(error).__name__})") from error
+            if response.is_success:
+                try:
+                    answer: dict[str, Any] = response.json()
+                except ValueError as error:
+                    raise HearsayError(
+                        "unexpected_response",
+                        f"HTTP {response.status_code} with a body that is not JSON",
+                        status=response.status_code,
+                        request_id=response.headers.get("request-id"),
+                    ) from error
+                return answer
+            failure = _problem(response)
+            again = failure.retryable or (failure.code == "internal" and not retried_internal)
+            if not (idempotent and again and attempt < len(self._retry.waits)):
+                raise failure
+            retried_internal = retried_internal or failure.code == "internal"
+            wait = self._retry.waits[attempt] * (1 + random.uniform(0, self._retry.jitter))
+            wait = max(wait, _retry_after(response))
+            log.warning(
+                "Hearsay %s %s failed with %s (request %s); trying again in %.2f s",
+                method,
+                path,
+                failure.code,
+                failure.request_id,
+                wait,
+            )
+            attempt += 1
+            await self._sleep(wait)
+
+
+def _read(
+    body: dict[str, Any], limit: int | None, min_store_state: int | None, on_behind: str | None
+) -> dict[str, Any]:
+    for name, value in (("limit", limit), ("min_store_state", min_store_state), ("on_behind", on_behind)):
+        if value is not None:
+            body[name] = value
+    return body
