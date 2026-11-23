@@ -5,7 +5,9 @@ startup, before any data call, when the service does not serve this client's con
 minor, or belongs to another environment than the one the client was configured for (handoff #5, #4).
 
 A failure is raised, never turned into an empty answer: a timeout, an unreachable service or a 5xx means there is
-no stored result, not that the store holds nothing. A service that does not answer fails the call at once, so a
+no stored result, not that the store holds nothing. Every failure is a :class:`HearsayError`, an answer whose body
+does not match the contract included (``unexpected_response``), so a caller catches that one type and nothing that
+could hide its own bugs. A service that does not answer fails the call at once, so a
 caller looking up before a fetch carries on without reuse rather than waiting out retries; a tell that fails is the
 caller's to queue.
 """
@@ -18,7 +20,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Self, TypeVar
 
 import httpx
 
@@ -41,8 +43,10 @@ from hearsay_client.types import (
 
 log = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 #: The contract version this client is built against. It is sent on every call but the handshake.
-CONTRACT_VERSION = "0.1"
+CONTRACT_VERSION = "1.0"
 
 CONTRACT_HEADER = "Hearsay-Contract"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
@@ -156,6 +160,29 @@ def _problem(response: httpx.Response) -> HearsayError:
     )
 
 
+def _shaped(what: str, read: Callable[[], T]) -> T:
+    """``read()``, which builds a call's answer from its body, with a body of the wrong shape raised as
+    ``unexpected_response``: a missing field, a field of the wrong type or a value that does not parse.
+
+    :raises HearsayError: ``unexpected_response``
+    """
+    try:
+        return read()
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+        raise HearsayError(
+            "unexpected_response", f"the answer to {what} does not match the contract ({type(error).__name__})"
+        ) from error
+
+
+def _told_id(body: dict[str, Any], name: str) -> str | None:
+    """A tell's id, which a replay whose first answer was cleared after 30 days does not carry. Any other answer
+    without it does not match the contract, and fails as ``unexpected_response``."""
+    if name not in body and body.get("replayed") is True:
+        return None
+    value: str = body[name]
+    return value
+
+
 def _retry_after(response: httpx.Response) -> float:
     value = response.headers.get("retry-after")
     try:
@@ -221,8 +248,11 @@ class HearsayClient:
         :raises HearsayError: the handshake itself failed
         """
         body = await self._request("GET", "/contract", contract=False)
-        handshake = Handshake.read(body)
-        check_handshake(handshake, contract=CONTRACT_VERSION, environment=self._environment)
+        handshake = _shaped("GET /contract", lambda: Handshake.read(body))
+        _shaped(
+            "GET /contract",
+            lambda: check_handshake(handshake, contract=CONTRACT_VERSION, environment=self._environment),
+        )
         self.handshake = handshake
         return handshake
 
@@ -231,25 +261,31 @@ class HearsayClient:
     async def register_reader(self, kind: str, name: str, version: str) -> Reader:
         """Register a reader at a version, or get the one already registered."""
         body = await self._request("POST", "/readers", json={"kind": kind, "name": name, "version": version})
-        return Reader(body["reader"], body["created"], Stamp.read(body["stamp"]))
+        return _shaped("POST /readers", lambda: Reader(body["reader"], body["created"], Stamp.read(body["stamp"])))
 
     # --- Tells -----------------------------------------------------------------------------------------------------
 
     async def tell_fetch(self, fetch: Fetch, *, idempotency_key: str | None = None) -> FetchTold:
         """Keep a fetch. A retry, by this client or a caller passing the same key, stores nothing again."""
         body = await self._tell("/tell/fetch", fetch.wire(), idempotency_key)
-        return FetchTold(
-            request=body["request"],
-            document=body.get("document"),
-            document_new=body.get("document_new"),
-            replayed=body.get("replayed", False),
-            stamp=Stamp.read(body["stamp"]),
+        return _shaped(
+            "POST /tell/fetch",
+            lambda: FetchTold(
+                request=_told_id(body, "request"),
+                document=body.get("document"),
+                document_new=body.get("document_new"),
+                replayed=body.get("replayed", False),
+                stamp=Stamp.read(body["stamp"]),
+            ),
         )
 
     async def tell_search(self, search: Search, *, idempotency_key: str | None = None) -> SearchTold:
         """Keep a search with its results, including none."""
         body = await self._tell("/tell/search", search.wire(), idempotency_key)
-        return SearchTold(body["event"], body.get("replayed", False), Stamp.read(body["stamp"]))
+        return _shaped(
+            "POST /tell/search",
+            lambda: SearchTold(_told_id(body, "event"), body.get("replayed", False), Stamp.read(body["stamp"])),
+        )
 
     async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> dict[str, Any]:
         # One key for every attempt, so a retry after a lost answer is replayed rather than written twice.
@@ -265,10 +301,13 @@ class HearsayClient:
         body = await self._request(
             "POST", "/lookup/url", json=_read({"url": url}, limit, min_store_state, on_behind)
         )
-        return UrlSeen(
-            witnesses=[Witness.read(witness) for witness in body["witnesses"]],
-            mine=[MyFetch.read(mine) for mine in body["mine"]],
-            stamp=Stamp.read(body["stamp"]),
+        return _shaped(
+            "POST /lookup/url",
+            lambda: UrlSeen(
+                witnesses=[Witness.read(witness) for witness in body["witnesses"]],
+                mine=[MyFetch.read(mine) for mine in body["mine"]],
+                stamp=Stamp.read(body["stamp"]),
+            ),
         )
 
     async def lookup_search(
@@ -289,7 +328,10 @@ class HearsayClient:
                 {"provider": provider, "query": query, "scope": dict(scope)}, limit, min_store_state, on_behind
             ),
         )
-        return SearchesSeen([SeenSearch.read(seen) for seen in body["searches"]], Stamp.read(body["stamp"]))
+        return _shaped(
+            "POST /lookup/search",
+            lambda: SearchesSeen([SeenSearch.read(seen) for seen in body["searches"]], Stamp.read(body["stamp"])),
+        )
 
     async def document(
         self,
@@ -304,14 +346,17 @@ class HearsayClient:
         given = (("start", start), ("end", end), ("min_store_state", min_store_state), ("on_behind", on_behind))
         params = {name: value for name, value in given if value is not None}
         body = await self._request("GET", f"/documents/{document}", params=params)
-        return KeptDocument(
-            document=body["document"],
-            length=body["length"],
-            start=body["start"],
-            end=body["end"],
-            text=body["text"],
-            mime_type=body.get("mime_type"),
-            stamp=Stamp.read(body["stamp"]),
+        return _shaped(
+            "GET /documents/{id}",
+            lambda: KeptDocument(
+                document=body["document"],
+                length=body["length"],
+                start=body["start"],
+                end=body["end"],
+                text=body["text"],
+                mime_type=body.get("mime_type"),
+                stamp=Stamp.read(body["stamp"]),
+            ),
         )
 
     # --- Transport -------------------------------------------------------------------------------------------------

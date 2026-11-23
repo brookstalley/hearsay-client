@@ -161,7 +161,10 @@ class Fetch:
 
 @dataclass(frozen=True)
 class FetchTold:
-    request: str
+    """A kept fetch. ``request`` is None only on a replay whose first answer was cleared, 30 days after it was
+    given: the fetch is kept, and ``stamp`` names the store state it was written at, but its ids are not returned."""
+
+    request: str | None
     document: str | None
     document_new: bool | None
     replayed: bool
@@ -223,7 +226,9 @@ class Search:
 
 @dataclass(frozen=True)
 class SearchTold:
-    event: str
+    """A kept search. ``event`` is None only on a replay whose first answer was cleared, as for :class:`FetchTold`."""
+
+    event: str | None
     replayed: bool
     stamp: Stamp
 
