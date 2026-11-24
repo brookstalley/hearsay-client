@@ -4,9 +4,16 @@ The client is a tolerant reader: a response field it does not know is ignored, a
 kept as the string it was sent, so a service that adds to its contract within a major never breaks it.
 """
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
+
+
+class Misshapen(ValueError):
+    """An answer that does not match the contract: a field missing, of the wrong JSON type, or a value that does not
+    parse. The client raises it as ``HearsayError("unexpected_response")``; nothing else is, so a bug in the client's
+    own code is never reported as the service's."""
 
 # --- Times --------------------------------------------------------------------------------------------------------
 
@@ -21,12 +28,93 @@ def wire_time(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _instant(value: str) -> datetime:
+    """A time as the contract sends it, RFC 3339 with its offset. One without an offset names no instant.
+
+    :raises Misshapen: the value does not parse, or carries no offset
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise Misshapen(f"{value!r} is not an RFC 3339 time") from error
+    if parsed.tzinfo is None:
+        raise Misshapen(f"{value!r} carries no time zone")
+    return parsed
+
+
 def _time(value: str | None) -> datetime | None:
-    return None if value is None else datetime.fromisoformat(value)
+    return None if value is None else _instant(value)
 
 
 def _day(value: str) -> date:
-    return date.fromisoformat(value)
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise Misshapen(f"{value!r} is not a calendar day") from error
+
+
+def _day_or_none(value: str | None) -> date | None:
+    return None if value is None else _day(value)
+
+
+# --- Reading a field ----------------------------------------------------------------------------------------------
+
+# Each reader below takes one field of an answer and checks its JSON type, so a wrong-typed field is refused where it
+# is read rather than handed to the caller. ``nullable`` lets the field be null; ``optional`` lets it be absent, read
+# as ``default``, and is given only where the contract leaves a field out (a tell's answer omits what does not apply):
+# absent and null mean different things. A refusal is a Misshapen, which the client raises as ``unexpected_response``.
+# A JSON boolean is never read as a number, though Python counts ``bool`` as an ``int``, and a number is finite.
+
+
+def _field(body: Any, name: str, kinds: tuple[type, ...], *, nullable: bool, optional: bool, default: Any) -> Any:
+    if not isinstance(body, dict):
+        raise Misshapen(f"an object was expected to hold {name}, not {type(body).__name__}")
+    if name not in body:
+        if optional:
+            return default
+        raise Misshapen(f"{name} is missing")
+    value = body[name]
+    if value is None and nullable:
+        return None
+    if not isinstance(value, kinds) or (isinstance(value, bool) and bool not in kinds):
+        raise Misshapen(f"{name} is {type(value).__name__}, not {' or '.join(kind.__name__ for kind in kinds)}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise Misshapen(f"{name} is {value}, not a finite number")
+    return value
+
+
+def _str(body: Any, name: str, *, nullable: bool = False, optional: bool = False) -> Any:
+    return _field(body, name, (str,), nullable=nullable, optional=optional, default=None)
+
+
+def _int(body: Any, name: str, *, nullable: bool = False, optional: bool = False) -> Any:
+    return _field(body, name, (int,), nullable=nullable, optional=optional, default=None)
+
+
+def _number(body: Any, name: str, *, nullable: bool = False, optional: bool = False) -> Any:
+    return _field(body, name, (int, float), nullable=nullable, optional=optional, default=None)
+
+
+def _bool(body: Any, name: str, *, nullable: bool = False, optional: bool = False, default: Any = None) -> Any:
+    return _field(body, name, (bool,), nullable=nullable, optional=optional, default=default)
+
+
+def _object(body: Any, name: str, *, nullable: bool = False) -> Any:
+    return _field(body, name, (dict,), nullable=nullable, optional=False, default=None)
+
+
+def _list(body: Any, name: str, *, optional: bool = False) -> list[Any]:
+    value: list[Any] = _field(body, name, (list,), nullable=False, optional=optional, default=[])
+    return value
+
+
+def _strings(body: Any, name: str, *, optional: bool = False) -> list[str]:
+    """A list of strings, each checked."""
+    values = _list(body, name, optional=optional)
+    for value in values:
+        if not isinstance(value, str):
+            raise Misshapen(f"{name} holds {type(value).__name__}, not str")
+    return list(values)
 
 
 # --- Common -------------------------------------------------------------------------------------------------------
@@ -46,12 +134,12 @@ class Stamp:
     @classmethod
     def read(cls, body: dict[str, Any]) -> "Stamp":
         return cls(
-            policy=body["policy"],
-            policy_version=body["policy_version"],
-            store_state=body["store_state"],
-            latest_store_state=body["latest_store_state"],
-            behind=body["behind"],
-            contract=body["contract"],
+            policy=_str(body, "policy", nullable=True),
+            policy_version=_str(body, "policy_version", nullable=True),
+            store_state=_int(body, "store_state"),
+            latest_store_state=_int(body, "latest_store_state"),
+            behind=_bool(body, "behind"),
+            contract=_str(body, "contract"),
         )
 
 
@@ -78,21 +166,21 @@ class Handshake:
     @classmethod
     def read(cls, body: dict[str, Any]) -> "Handshake":
         return cls(
-            service=body["service"],
-            environment=body["environment"],
-            product=body["product"],
-            roles=list(body["roles"]),
+            service=_str(body, "service"),
+            environment=_str(body, "environment"),
+            product=_str(body, "product"),
+            roles=_strings(body, "roles"),
             contracts=[
                 ServedContract(
-                    version=served["version"],
-                    status=served["status"],
-                    sunset=None if served.get("sunset") is None else _day(served["sunset"]),
+                    version=_str(served, "version"),
+                    status=_str(served, "status"),
+                    sunset=_day_or_none(_str(served, "sunset", nullable=True, optional=True)),
                 )
-                for served in body["contracts"]
+                for served in _list(body, "contracts")
             ],
-            default_policy=body["default_policy"],
-            default_policy_version=body["default_policy_version"],
-            store_state=body["store_state"],
+            default_policy=_str(body, "default_policy", nullable=True),
+            default_policy_version=_str(body, "default_policy_version", nullable=True),
+            store_state=_int(body, "store_state"),
         )
 
 
@@ -190,7 +278,13 @@ class SearchResult:
 
     @classmethod
     def read(cls, body: dict[str, Any]) -> "SearchResult":
-        return cls(body["rank"], body["url"], body["title"], body.get("snippet"), body.get("score"))
+        return cls(
+            rank=_int(body, "rank"),
+            url=_str(body, "url"),
+            title=_str(body, "title", nullable=True),
+            snippet=_str(body, "snippet", nullable=True),
+            score=_number(body, "score", nullable=True),
+        )
 
 
 @dataclass(frozen=True)
@@ -255,17 +349,17 @@ class Witness:
     @classmethod
     def read(cls, body: dict[str, Any]) -> "Witness":
         return cls(
-            event=body["event"],
-            audience=body["audience"],
-            url_requested=body["url_requested"],
-            url_final=body.get("url_final"),
-            retrieved_on=_day(body["retrieved_on"]),
-            document=body["document"],
-            chars_read=body.get("chars_read"),
-            chars_total=body.get("chars_total"),
-            etag=body.get("etag"),
-            last_modified=_time(body.get("last_modified")),
-            published_at=_time(body.get("published_at")),
+            event=_str(body, "event"),
+            audience=_str(body, "audience"),
+            url_requested=_str(body, "url_requested"),
+            url_final=_str(body, "url_final", nullable=True),
+            retrieved_on=_day(_str(body, "retrieved_on")),
+            document=_str(body, "document"),
+            chars_read=_int(body, "chars_read", nullable=True),
+            chars_total=_int(body, "chars_total", nullable=True),
+            etag=_str(body, "etag", nullable=True),
+            last_modified=_time(_str(body, "last_modified", nullable=True)),
+            published_at=_time(_str(body, "published_at", nullable=True)),
         )
 
 
@@ -284,13 +378,13 @@ class MyFetch:
     @classmethod
     def read(cls, body: dict[str, Any]) -> "MyFetch":
         return cls(
-            request=body["request"],
-            url_requested=body["url_requested"],
-            url_final=body.get("url_final"),
-            retrieved_at=datetime.fromisoformat(body["retrieved_at"]),
-            outcome=body["outcome"],
-            document=body.get("document"),
-            witness=body.get("witness"),
+            request=_str(body, "request"),
+            url_requested=_str(body, "url_requested"),
+            url_final=_str(body, "url_final", nullable=True),
+            retrieved_at=_instant(_str(body, "retrieved_at")),
+            outcome=_str(body, "outcome"),
+            document=_str(body, "document", nullable=True),
+            witness=_str(body, "witness", nullable=True),
         )
 
 
@@ -317,25 +411,25 @@ class SeenSearch:
     duration_ms: int | None
     result_count: int
     error: str | None
-    degradation: Any
+    degradation: dict[str, Any] | None
     results: list[SearchResult]
     erased: list[str] = field(default_factory=list)
 
     @classmethod
     def read(cls, body: dict[str, Any]) -> "SeenSearch":
         return cls(
-            event=body["event"],
-            reader=body["reader"],
-            provider=body["provider"],
-            query=body["query"],
-            scope=body["scope"],
-            retrieved_at=datetime.fromisoformat(body["retrieved_at"]),
-            duration_ms=body.get("duration_ms"),
-            result_count=body["result_count"],
-            error=body.get("error"),
-            degradation=body.get("degradation"),
-            results=[SearchResult.read(result) for result in body["results"]],
-            erased=list(body.get("erased", [])),
+            event=_str(body, "event"),
+            reader=_str(body, "reader"),
+            provider=_str(body, "provider", nullable=True),
+            query=_str(body, "query", nullable=True),
+            scope=_object(body, "scope", nullable=True),
+            retrieved_at=_instant(_str(body, "retrieved_at")),
+            duration_ms=_int(body, "duration_ms", nullable=True),
+            result_count=_int(body, "result_count"),
+            error=_str(body, "error", nullable=True),
+            degradation=_object(body, "degradation", nullable=True),
+            results=[SearchResult.read(result) for result in _list(body, "results")],
+            erased=_strings(body, "erased"),
         )
 
 

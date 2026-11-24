@@ -29,6 +29,7 @@ from hearsay_client.types import (
     FetchTold,
     Handshake,
     KeptDocument,
+    Misshapen,
     MyFetch,
     Reader,
     Search,
@@ -39,6 +40,11 @@ from hearsay_client.types import (
     Stamp,
     UrlSeen,
     Witness,
+    _bool,
+    _int,
+    _list,
+    _object,
+    _str,
 )
 
 log = logging.getLogger(__name__)
@@ -99,7 +105,8 @@ class RetryPolicy:
 def _version(text: str) -> tuple[int, int]:
     matched = _VERSION.fullmatch(text)
     if matched is None:
-        raise ValueError(f"{text!r} is not a MAJOR.MINOR contract version")
+        # Misshapen, a ValueError: a served version that does not parse is an answer that does not match the contract.
+        raise Misshapen(f"{text!r} is not a MAJOR.MINOR contract version")
     return int(matched[1]), int(matched[2])
 
 
@@ -135,29 +142,41 @@ def check_handshake(handshake: Handshake, *, contract: str, environment: str) ->
 
 
 def _problem(response: httpx.Response) -> HearsayError:
-    """The error a failed response carries, read as the contract's problem object where it is one."""
+    """The error a failed response carries, read as the contract's problem object where it is one. A problem object
+    whose fields are of the wrong type is ``unexpected_response`` too, retryable only as a gateway failure is: a
+    ``retryable`` that is not a boolean is never read as one."""
     try:
         body = response.json()
     except ValueError:
         body = None
+    gateway = response.status_code in (502, 503, 504)
     if not isinstance(body, dict) or "code" not in body:
         # Not the service's answer, such as a proxy's page. A gateway failure may pass; anything else is not ours.
         return HearsayError(
             "unexpected_response",
             f"HTTP {response.status_code} without a problem object",
             status=response.status_code,
-            retryable=response.status_code in (502, 503, 504),
+            retryable=gateway,
             request_id=response.headers.get("request-id"),
         )
-    return HearsayError(
-        str(body["code"]),
-        str(body.get("title", "")),
-        status=response.status_code,
-        error_class=body.get("class"),
-        retryable=bool(body.get("retryable", False)),
-        request_id=body.get("request_id"),
-        errors=[(str(error.get("path")), str(error.get("code"))) for error in body.get("errors", [])],
-    )
+    try:
+        return HearsayError(
+            _str(body, "code"),
+            _str(body, "title", nullable=True, optional=True) or "",
+            status=response.status_code,
+            error_class=_str(body, "class", nullable=True, optional=True),
+            retryable=_bool(body, "retryable", optional=True, default=False),
+            request_id=_str(body, "request_id", nullable=True, optional=True),
+            errors=[(_str(error, "path"), _str(error, "code")) for error in _list(body, "errors", optional=True)],
+        )
+    except Misshapen as error:
+        return HearsayError(
+            "unexpected_response",
+            f"HTTP {response.status_code} with a problem object that does not match the contract ({error})",
+            status=response.status_code,
+            retryable=gateway,
+            request_id=response.headers.get("request-id"),
+        )
 
 
 @dataclass(frozen=True)
@@ -172,16 +191,17 @@ class _Answer:
 def _shaped(what: str, answer: _Answer, read: Callable[[dict[str, Any]], T]) -> T:
     """``read(body)``, which builds a call's answer from its body, with a body of the wrong shape raised as
     ``unexpected_response``: a missing field, a field of the wrong type or a value that does not parse. The error
-    carries the call's status and request id, so the service's log line for it can be found.
+    carries the call's status and request id, so the service's log line for it can be found. Only the readers'
+    :class:`Misshapen` is caught, so a bug in the client's own code surfaces as itself, never as the service's.
 
     :raises HearsayError: ``unexpected_response``
     """
     try:
         return read(answer.body)
-    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+    except Misshapen as error:
         raise HearsayError(
             "unexpected_response",
-            f"the answer to {what} does not match the contract ({type(error).__name__})",
+            f"the answer to {what} does not match the contract ({error})",
             status=answer.status,
             request_id=answer.request_id,
         ) from error
@@ -190,9 +210,9 @@ def _shaped(what: str, answer: _Answer, read: Callable[[dict[str, Any]], T]) -> 
 def _told_id(body: dict[str, Any], name: str) -> str | None:
     """A tell's id, which a replay whose first answer was cleared after 30 days does not carry. Any other answer
     without it does not match the contract, and fails as ``unexpected_response``."""
-    if name not in body and body.get("replayed") is True:
+    if isinstance(body, dict) and name not in body and body.get("replayed") is True:
         return None
-    value: str = body[name]
+    value: str = _str(body, name)
     return value
 
 
@@ -276,7 +296,9 @@ class HearsayClient:
         """Register a reader at a version, or get the one already registered."""
         answer = await self._request("POST", "/readers", json={"kind": kind, "name": name, "version": version})
         return _shaped(
-            "POST /readers", answer, lambda body: Reader(body["reader"], body["created"], Stamp.read(body["stamp"]))
+            "POST /readers",
+            answer,
+            lambda body: Reader(_str(body, "reader"), _bool(body, "created"), Stamp.read(_object(body, "stamp"))),
         )
 
     # --- Tells -----------------------------------------------------------------------------------------------------
@@ -289,10 +311,10 @@ class HearsayClient:
             answer,
             lambda body: FetchTold(
                 request=_told_id(body, "request"),
-                document=body.get("document"),
-                document_new=body.get("document_new"),
-                replayed=body.get("replayed", False),
-                stamp=Stamp.read(body["stamp"]),
+                document=_str(body, "document", nullable=True, optional=True),
+                document_new=_bool(body, "document_new", nullable=True, optional=True),
+                replayed=_bool(body, "replayed", optional=True, default=False),
+                stamp=Stamp.read(_object(body, "stamp")),
             ),
         )
 
@@ -302,7 +324,11 @@ class HearsayClient:
         return _shaped(
             "POST /tell/search",
             answer,
-            lambda body: SearchTold(_told_id(body, "event"), body.get("replayed", False), Stamp.read(body["stamp"])),
+            lambda body: SearchTold(
+                _told_id(body, "event"),
+                _bool(body, "replayed", optional=True, default=False),
+                Stamp.read(_object(body, "stamp")),
+            ),
         )
 
     async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> _Answer:
@@ -323,9 +349,9 @@ class HearsayClient:
             "POST /lookup/url",
             answer,
             lambda body: UrlSeen(
-                witnesses=[Witness.read(witness) for witness in body["witnesses"]],
-                mine=[MyFetch.read(mine) for mine in body["mine"]],
-                stamp=Stamp.read(body["stamp"]),
+                witnesses=[Witness.read(witness) for witness in _list(body, "witnesses")],
+                mine=[MyFetch.read(mine) for mine in _list(body, "mine")],
+                stamp=Stamp.read(_object(body, "stamp")),
             ),
         )
 
@@ -350,7 +376,9 @@ class HearsayClient:
         return _shaped(
             "POST /lookup/search",
             answer,
-            lambda body: SearchesSeen([SeenSearch.read(seen) for seen in body["searches"]], Stamp.read(body["stamp"])),
+            lambda body: SearchesSeen(
+                [SeenSearch.read(seen) for seen in _list(body, "searches")], Stamp.read(_object(body, "stamp"))
+            ),
         )
 
     async def document(
@@ -370,13 +398,13 @@ class HearsayClient:
             "GET /documents/{id}",
             answer,
             lambda body: KeptDocument(
-                document=body["document"],
-                length=body["length"],
-                start=body["start"],
-                end=body["end"],
-                text=body["text"],
-                mime_type=body.get("mime_type"),
-                stamp=Stamp.read(body["stamp"]),
+                document=_str(body, "document"),
+                length=_int(body, "length"),
+                start=_int(body, "start"),
+                end=_int(body, "end"),
+                text=_str(body, "text"),
+                mime_type=_str(body, "mime_type", nullable=True),
+                stamp=Stamp.read(_object(body, "stamp")),
             ),
         )
 
