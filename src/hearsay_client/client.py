@@ -160,17 +160,30 @@ def _problem(response: httpx.Response) -> HearsayError:
     )
 
 
-def _shaped(what: str, read: Callable[[], T]) -> T:
-    """``read()``, which builds a call's answer from its body, with a body of the wrong shape raised as
-    ``unexpected_response``: a missing field, a field of the wrong type or a value that does not parse.
+@dataclass(frozen=True)
+class _Answer:
+    """A successful call's parsed body, with what an error about it must carry for the service's operator."""
+
+    body: dict[str, Any]
+    status: int
+    request_id: str | None
+
+
+def _shaped(what: str, answer: _Answer, read: Callable[[dict[str, Any]], T]) -> T:
+    """``read(body)``, which builds a call's answer from its body, with a body of the wrong shape raised as
+    ``unexpected_response``: a missing field, a field of the wrong type or a value that does not parse. The error
+    carries the call's status and request id, so the service's log line for it can be found.
 
     :raises HearsayError: ``unexpected_response``
     """
     try:
-        return read()
+        return read(answer.body)
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
         raise HearsayError(
-            "unexpected_response", f"the answer to {what} does not match the contract ({type(error).__name__})"
+            "unexpected_response",
+            f"the answer to {what} does not match the contract ({type(error).__name__})",
+            status=answer.status,
+            request_id=answer.request_id,
         ) from error
 
 
@@ -247,11 +260,12 @@ class HearsayClient:
         :raises ContractMismatchError: the service cannot serve this client
         :raises HearsayError: the handshake itself failed
         """
-        body = await self._request("GET", "/contract", contract=False)
-        handshake = _shaped("GET /contract", lambda: Handshake.read(body))
+        answer = await self._request("GET", "/contract", contract=False)
+        handshake = _shaped("GET /contract", answer, Handshake.read)
         _shaped(
             "GET /contract",
-            lambda: check_handshake(handshake, contract=CONTRACT_VERSION, environment=self._environment),
+            answer,
+            lambda body: check_handshake(handshake, contract=CONTRACT_VERSION, environment=self._environment),
         )
         self.handshake = handshake
         return handshake
@@ -260,17 +274,20 @@ class HearsayClient:
 
     async def register_reader(self, kind: str, name: str, version: str) -> Reader:
         """Register a reader at a version, or get the one already registered."""
-        body = await self._request("POST", "/readers", json={"kind": kind, "name": name, "version": version})
-        return _shaped("POST /readers", lambda: Reader(body["reader"], body["created"], Stamp.read(body["stamp"])))
+        answer = await self._request("POST", "/readers", json={"kind": kind, "name": name, "version": version})
+        return _shaped(
+            "POST /readers", answer, lambda body: Reader(body["reader"], body["created"], Stamp.read(body["stamp"]))
+        )
 
     # --- Tells -----------------------------------------------------------------------------------------------------
 
     async def tell_fetch(self, fetch: Fetch, *, idempotency_key: str | None = None) -> FetchTold:
         """Keep a fetch. A retry, by this client or a caller passing the same key, stores nothing again."""
-        body = await self._tell("/tell/fetch", fetch.wire(), idempotency_key)
+        answer = await self._tell("/tell/fetch", fetch.wire(), idempotency_key)
         return _shaped(
             "POST /tell/fetch",
-            lambda: FetchTold(
+            answer,
+            lambda body: FetchTold(
                 request=_told_id(body, "request"),
                 document=body.get("document"),
                 document_new=body.get("document_new"),
@@ -281,13 +298,14 @@ class HearsayClient:
 
     async def tell_search(self, search: Search, *, idempotency_key: str | None = None) -> SearchTold:
         """Keep a search with its results, including none."""
-        body = await self._tell("/tell/search", search.wire(), idempotency_key)
+        answer = await self._tell("/tell/search", search.wire(), idempotency_key)
         return _shaped(
             "POST /tell/search",
-            lambda: SearchTold(_told_id(body, "event"), body.get("replayed", False), Stamp.read(body["stamp"])),
+            answer,
+            lambda body: SearchTold(_told_id(body, "event"), body.get("replayed", False), Stamp.read(body["stamp"])),
         )
 
-    async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> dict[str, Any]:
+    async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> _Answer:
         # One key for every attempt, so a retry after a lost answer is replayed rather than written twice.
         key = idempotency_key or str(uuid.uuid4())
         return await self._request("POST", path, json=body, headers={IDEMPOTENCY_HEADER: key})
@@ -298,12 +316,13 @@ class HearsayClient:
         self, url: str, *, limit: int | None = None, min_store_state: int | None = None, on_behind: str | None = None
     ) -> UrlSeen:
         """Q1: the world's witnesses of ``url`` and this product's own fetches of it, newest first."""
-        body = await self._request(
+        answer = await self._request(
             "POST", "/lookup/url", json=_read({"url": url}, limit, min_store_state, on_behind)
         )
         return _shaped(
             "POST /lookup/url",
-            lambda: UrlSeen(
+            answer,
+            lambda body: UrlSeen(
                 witnesses=[Witness.read(witness) for witness in body["witnesses"]],
                 mine=[MyFetch.read(mine) for mine in body["mine"]],
                 stamp=Stamp.read(body["stamp"]),
@@ -321,7 +340,7 @@ class HearsayClient:
         on_behind: str | None = None,
     ) -> SearchesSeen:
         """Q2: this product's searches with exactly this provider, query and scope, newest first."""
-        body = await self._request(
+        answer = await self._request(
             "POST",
             "/lookup/search",
             json=_read(
@@ -330,7 +349,8 @@ class HearsayClient:
         )
         return _shaped(
             "POST /lookup/search",
-            lambda: SearchesSeen([SeenSearch.read(seen) for seen in body["searches"]], Stamp.read(body["stamp"])),
+            answer,
+            lambda body: SearchesSeen([SeenSearch.read(seen) for seen in body["searches"]], Stamp.read(body["stamp"])),
         )
 
     async def document(
@@ -345,10 +365,11 @@ class HearsayClient:
         """A kept page's text, or characters ``[start, end)`` of it."""
         given = (("start", start), ("end", end), ("min_store_state", min_store_state), ("on_behind", on_behind))
         params = {name: value for name, value in given if value is not None}
-        body = await self._request("GET", f"/documents/{document}", params=params)
+        answer = await self._request("GET", f"/documents/{document}", params=params)
         return _shaped(
             "GET /documents/{id}",
-            lambda: KeptDocument(
+            answer,
+            lambda body: KeptDocument(
                 document=body["document"],
                 length=body["length"],
                 start=body["start"],
@@ -371,7 +392,7 @@ class HearsayClient:
         headers: dict[str, str] | None = None,
         contract: bool = True,
         idempotent: bool = True,
-    ) -> dict[str, Any]:
+    ) -> _Answer:
         """One call, tried again on a retryable answer while the policy allows, when the call is idempotent. No
         answer at all is raised at once as ``unreachable``.
 
@@ -407,7 +428,7 @@ class HearsayClient:
                         status=response.status_code,
                         request_id=response.headers.get("request-id"),
                     ) from error
-                return answer
+                return _Answer(answer, response.status_code, response.headers.get("request-id"))
             failure = _problem(response)
             again = failure.retryable or (failure.code == "internal" and not retried_internal)
             if not (idempotent and again and attempt < len(self._retry.waits)):
