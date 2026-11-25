@@ -7,6 +7,7 @@ kept as the string it was sent, so a service that adds to its contract within a 
 import math
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any
 
 
@@ -194,6 +195,206 @@ class Reader:
     stamp: Stamp
 
 
+# --- Relations ----------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RelationDeclared:
+    """A declared relation, named by ``relation`` in the product's statements; ``created`` is false when the same
+    body was declared before."""
+
+    relation: str
+    created: bool
+    stamp: Stamp
+
+
+@dataclass(frozen=True)
+class Relation:
+    """A relation a statement may name: a curated one, or the caller's own declared one. ``means`` is None once
+    erased; ``declared_at`` is None for a curated relation."""
+
+    relation: str
+    curated: bool
+    means: str | None
+    subject: str
+    object: str
+    object_schemes: tuple[str, ...]
+    declared_at: datetime | None
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "Relation":
+        return cls(
+            relation=_str(body, "relation"),
+            curated=_bool(body, "curated"),
+            means=_str(body, "means", nullable=True),
+            subject=_str(body, "subject"),
+            object=_str(body, "object"),
+            object_schemes=tuple(_strings(body, "object_schemes")),
+            declared_at=_time(_str(body, "declared_at", nullable=True, optional=True)),
+        )
+
+
+@dataclass(frozen=True)
+class Relations:
+    relations: tuple[Relation, ...]
+    stamp: Stamp
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "Relations":
+        items = _list(body, "relations")
+        return cls(tuple(Relation.read(item) for item in items), Stamp.read(_object(body, "stamp")))
+
+
+# --- Utterances ---------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Identifier:
+    """A value in a scheme, as the product issued or learned it: ``Identifier("isrc", "USSM17800123")``."""
+
+    scheme: str
+    value: str
+
+    def wire(self) -> dict[str, Any]:
+        return {"scheme": self.scheme, "value": self.value}
+
+
+@dataclass(frozen=True)
+class EntityTerm:
+    """An entity, named by its ``en_`` id or by typed identifiers, exactly one. Identifiers resolve to the entity this
+    product's own identifier claims name, or a new one."""
+
+    entity: str | None = None
+    identifiers: tuple[Identifier, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (self.entity is None) == (not self.identifiers):
+            raise ValueError("an entity is named by its id or by identifiers, exactly one")
+
+    def wire(self) -> dict[str, Any]:
+        if self.entity is not None:
+            return {"entity": self.entity}
+        return {"identifiers": [identifier.wire() for identifier in self.identifiers]}
+
+
+@dataclass(frozen=True)
+class StatementTerm:
+    """A statement this product may see, by its ``st_`` id, such as an utterance a witnessed statement is about."""
+
+    statement: str
+
+    def wire(self) -> dict[str, Any]:
+        return {"statement": self.statement}
+
+
+@dataclass(frozen=True)
+class ValueTerm:
+    """A typed value: a number, or a time or period given by one or both ends. There is no text form, since a value
+    is never sent as prose."""
+
+    number: Decimal | int | None = None
+    time_from: datetime | None = None
+    time_to: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if (self.number is None) == (self.time_from is None and self.time_to is None):
+            raise ValueError("a value is a number or a time, exactly one")
+        if isinstance(self.number, Decimal) and not self.number.is_finite():
+            raise ValueError("a value's number must be finite")
+
+    def wire(self) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        if self.number is not None:
+            # Plain decimal in a string, as the contract takes it: no exponent, and no precision lost to a float.
+            value["number"] = format(Decimal(self.number), "f")
+        if self.time_from is not None:
+            value["time_from"] = wire_time(self.time_from)
+        if self.time_to is not None:
+            value["time_to"] = wire_time(self.time_to)
+        return {"value": value}
+
+
+@dataclass(frozen=True)
+class AboutItem:
+    """One of this product's own statements about an utterance: a relation it declared with subject ``utterance``,
+    and its object."""
+
+    relation: str
+    object: EntityTerm | ValueTerm
+
+    def wire(self) -> dict[str, Any]:
+        return {"relation": self.relation, "object": self.object.wire()}
+
+
+@dataclass(frozen=True)
+class Utterance:
+    """One aired segment, as ``POST /tell/utterance`` takes it. ``audience`` is ``world`` or ``product``, set from
+    the venue's access when it aired; at least one of the two times is given. Listener names and counts have no
+    field: the service refuses them."""
+
+    reader: str
+    audience: str
+    speaker: EntityTerm
+    text: str
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    said_in: EntityTerm | None = None
+    on_behalf_of: EntityTerm | None = None
+    about: tuple[AboutItem, ...] = ()
+
+    def wire(self) -> dict[str, Any]:
+        return {
+            "reader": self.reader,
+            "audience": self.audience,
+            "speaker": self.speaker.wire(),
+            "said_in": None if self.said_in is None else self.said_in.wire(),
+            "on_behalf_of": None if self.on_behalf_of is None else self.on_behalf_of.wire(),
+            "started_at": None if self.started_at is None else wire_time(self.started_at),
+            "ended_at": None if self.ended_at is None else wire_time(self.ended_at),
+            "text": self.text,
+            "about": [item.wire() for item in self.about],
+        }
+
+
+@dataclass(frozen=True)
+class ResolvedEntity:
+    """The entity a term named, and whether it was found by an identifier or minted."""
+
+    entity: str
+    resolved_by: str
+
+
+@dataclass(frozen=True)
+class AboutTold:
+    """One ``about`` statement as written. ``object`` is None for a typed value."""
+
+    index: int
+    statement: str
+    object: ResolvedEntity | None
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "AboutTold":
+        given = _object(body, "object", nullable=True)
+        return cls(
+            index=_int(body, "index"),
+            statement=_str(body, "statement"),
+            object=None if given is None else ResolvedEntity(_str(given, "entity"), _str(given, "resolved_by")),
+        )
+
+
+@dataclass(frozen=True)
+class UtteranceTold:
+    """A kept utterance. ``document`` is the kept words of a world utterance, and None for a product one.
+    ``utterance`` is None only on a replay whose first answer was cleared, as for :class:`FetchTold`, and ``about`` is
+    then empty."""
+
+    utterance: str | None
+    document: str | None
+    about: tuple[AboutTold, ...]
+    replayed: bool
+    stamp: Stamp
+
+
 # --- Tells --------------------------------------------------------------------------------------------------------
 
 
@@ -325,6 +526,74 @@ class SearchTold:
     event: str | None
     replayed: bool
     stamp: Stamp
+
+
+@dataclass(frozen=True)
+class Witnessed:
+    """One witnessed statement, as ``POST /tell/witnessed`` takes it: a subject, one of this product's declared
+    relations by name, an object, and its valid time, either end of which may be unknown."""
+
+    subject: EntityTerm | StatementTerm
+    relation: str
+    object: EntityTerm | ValueTerm
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+    def wire(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"subject": self.subject.wire(), "relation": self.relation, "object": self.object.wire()}
+        if self.valid_from is not None or self.valid_to is not None:
+            body["valid"] = {
+                "from": None if self.valid_from is None else wire_time(self.valid_from),
+                "to": None if self.valid_to is None else wire_time(self.valid_to),
+            }
+        return body
+
+
+@dataclass(frozen=True)
+class WitnessedObject:
+    """The entity a statement's object named, and whether its identifiers found it (``identifier``) or it was made
+    (``minted``)."""
+
+    entity: str
+    resolved_by: str
+
+
+@dataclass(frozen=True)
+class WitnessedStatement:
+    """One kept witnessed statement, at ``index`` in the tell. ``object`` is None for a value object."""
+
+    index: int
+    statement: str
+    object: WitnessedObject | None
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "WitnessedStatement":
+        named = _object(body, "object", nullable=True)
+        return cls(
+            index=_int(body, "index"),
+            statement=_str(body, "statement"),
+            object=None if named is None else WitnessedObject(_str(named, "entity"), _str(named, "resolved_by")),
+        )
+
+
+@dataclass(frozen=True)
+class WitnessedTold:
+    """Kept witnessed statements, in the order told. ``statements`` is None only on a replay whose first answer was
+    cleared, as for :class:`FetchTold`."""
+
+    statements: tuple[WitnessedStatement, ...] | None
+    replayed: bool
+    stamp: Stamp
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "WitnessedTold":
+        replayed = _bool(body, "replayed", optional=True, default=False)
+        cleared = isinstance(body, dict) and "statements" not in body and replayed is True
+        return cls(
+            statements=None if cleared else tuple(WitnessedStatement.read(item) for item in _list(body, "statements")),
+            replayed=replayed,
+            stamp=Stamp.read(_object(body, "stamp")),
+        )
 
 
 # --- Look-ups -----------------------------------------------------------------------------------------------------

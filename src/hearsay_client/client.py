@@ -17,7 +17,7 @@ import logging
 import random
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self, TypeVar
@@ -25,6 +25,7 @@ from typing import Any, Self, TypeVar
 import httpx
 
 from hearsay_client.types import (
+    AboutTold,
     Fetch,
     FetchTold,
     Handshake,
@@ -32,6 +33,8 @@ from hearsay_client.types import (
     Misshapen,
     MyFetch,
     Reader,
+    RelationDeclared,
+    Relations,
     Search,
     SearchesSeen,
     SearchTold,
@@ -39,7 +42,11 @@ from hearsay_client.types import (
     ServedContract,
     Stamp,
     UrlSeen,
+    Utterance,
+    UtteranceTold,
     Witness,
+    Witnessed,
+    WitnessedTold,
     _bool,
     _int,
     _list,
@@ -52,7 +59,7 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 #: The contract version this client is built against. It is sent on every call but the handshake.
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 
 CONTRACT_HEADER = "Hearsay-Contract"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
@@ -301,6 +308,56 @@ class HearsayClient:
             lambda body: Reader(_str(body, "reader"), _bool(body, "created"), Stamp.read(_object(body, "stamp"))),
         )
 
+    # --- Relations -------------------------------------------------------------------------------------------------
+
+    async def declare_relation(
+        self, name: str, means: str, *, subject: str, object: str, object_schemes: Sequence[str] = ()
+    ) -> RelationDeclared:
+        """Declare a relation this product uses, once: its name, a one-line meaning, the kind of its subject
+        (``utterance`` or ``entity``) and of its object (``entity`` or ``value``), and the identifier schemes an entity
+        object may be given by. Declaring the same body again returns it; a changed body under a used name is
+        ``relation_conflict``, since a changed meaning is a new name."""
+        body = {
+            "name": name,
+            "means": means,
+            "subject": subject,
+            "object": object,
+            "object_schemes": list(object_schemes),
+        }
+        answer = await self._request("POST", "/relations", json=body)
+        return _shaped(
+            "POST /relations",
+            answer,
+            lambda body: RelationDeclared(
+                _str(body, "relation"), _bool(body, "created"), Stamp.read(_object(body, "stamp"))
+            ),
+        )
+
+    async def relations(self, *, min_store_state: int | None = None, on_behind: str | None = None) -> Relations:
+        """The curated relations and this product's own declared ones."""
+        given = (("min_store_state", min_store_state), ("on_behind", on_behind))
+        params = {name: value for name, value in given if value is not None}
+        answer = await self._request("GET", "/relations", params=params)
+        return _shaped("GET /relations", answer, Relations.read)
+
+    # --- Utterances ------------------------------------------------------------------------------------------------
+
+    async def tell_utterance(self, utterance: Utterance, *, idempotency_key: str | None = None) -> UtteranceTold:
+        """Keep one aired segment with this product's own statements about it. Pass the segment's own stable id as
+        ``idempotency_key``, so a backfill or a retry stores nothing twice."""
+        answer = await self._tell("/tell/utterance", utterance.wire(), idempotency_key)
+        return _shaped(
+            "POST /tell/utterance",
+            answer,
+            lambda body: UtteranceTold(
+                utterance=_told_id(body, "utterance"),
+                document=_str(body, "document", nullable=True, optional=True),
+                about=tuple(AboutTold.read(item) for item in _list(body, "about", optional=True)),
+                replayed=_bool(body, "replayed", optional=True, default=False),
+                stamp=Stamp.read(_object(body, "stamp")),
+            ),
+        )
+
     # --- Tells -----------------------------------------------------------------------------------------------------
 
     async def tell_fetch(self, fetch: Fetch, *, idempotency_key: str | None = None) -> FetchTold:
@@ -330,6 +387,15 @@ class HearsayClient:
                 Stamp.read(_object(body, "stamp")),
             ),
         )
+
+    async def tell_witnessed(
+        self, statements: Sequence[Witnessed], *, reader: str, idempotency_key: str | None = None
+    ) -> WitnessedTold:
+        """Keep this product's own witnessed statements, 1 to 200, each using one of its declared relations: all of
+        them, or none when one is refused. A retry with the same key stores nothing again."""
+        body = {"reader": reader, "statements": [statement.wire() for statement in statements]}
+        answer = await self._tell("/tell/witnessed", body, idempotency_key)
+        return _shaped("POST /tell/witnessed", answer, WitnessedTold.read)
 
     async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> _Answer:
         # One key for every attempt, so a retry after a lost answer is replayed rather than written twice.
