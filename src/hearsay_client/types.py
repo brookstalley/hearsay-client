@@ -16,6 +16,7 @@ class Misshapen(ValueError):
     parse. The client raises it as ``HearsayError("unexpected_response")``; nothing else is, so a bug in the client's
     own code is never reported as the service's."""
 
+
 # --- Times --------------------------------------------------------------------------------------------------------
 
 
@@ -211,7 +212,9 @@ class RelationDeclared:
 @dataclass(frozen=True)
 class Relation:
     """A relation a statement may name: a curated one, or the caller's own declared one. ``means`` is None once
-    erased; ``declared_at`` is None for a curated relation."""
+    erased, and for a curated relation, whose meaning is in the curation files: ``means_digest`` is its SHA-256.
+    ``declared_at`` is None for a curated relation. A curated relation's ``subject_kinds``, ``object_kinds`` and
+    ``qualifiers`` are hints, never checked."""
 
     relation: str
     curated: bool
@@ -220,6 +223,10 @@ class Relation:
     object: str
     object_schemes: tuple[str, ...]
     declared_at: datetime | None
+    means_digest: str | None = None
+    subject_kinds: tuple[str, ...] = ()
+    object_kinds: tuple[str, ...] = ()
+    qualifiers: tuple[str, ...] = ()
 
     @classmethod
     def read(cls, body: dict[str, Any]) -> "Relation":
@@ -231,6 +238,10 @@ class Relation:
             object=_str(body, "object"),
             object_schemes=tuple(_strings(body, "object_schemes")),
             declared_at=_time(_str(body, "declared_at", nullable=True, optional=True)),
+            means_digest=_str(body, "means_digest", nullable=True, optional=True),
+            subject_kinds=tuple(_strings(body, "subject_kinds", optional=True)),
+            object_kinds=tuple(_strings(body, "object_kinds", optional=True)),
+            qualifiers=tuple(_strings(body, "qualifiers", optional=True)),
         )
 
 
@@ -261,8 +272,11 @@ class Identifier:
 
 @dataclass(frozen=True)
 class EntityTerm:
-    """An entity, named by its ``en_`` id or by typed identifiers, exactly one. Identifiers resolve to the entity this
-    product's own identifier claims name, or a new one."""
+    """An entity, named by its ``en_`` id or by typed identifiers, exactly one. At contract 1.5, which this client
+    states, identifiers resolve through curated schemes: one in a scheme curation flags "names one" (a MusicBrainz
+    recording) meets the entity a world claim gives it, one in a curated scheme without the flag (an ISRC) joins
+    nothing and is only claimed, and one in the product's own scheme meets the entity this product's own claims give
+    it. Where none matches, a new entity is minted."""
 
     entity: str | None = None
     identifiers: tuple[Identifier, ...] = ()
@@ -596,6 +610,308 @@ class WitnessedTold:
         )
 
 
+# --- Reader statements (contract 1.2) -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Span:
+    """Character offsets ``[start, end)`` into a kept document's text, as Python ``str`` indices count them."""
+
+    start: int
+    end: int
+
+    def wire(self) -> dict[str, Any]:
+        return {"start": self.start, "end": self.end}
+
+
+@dataclass(frozen=True)
+class Mention:
+    """The words a statement uses for an entity: a ``span`` of the document, or in a product statement the reader's
+    own ``words``, exactly one. ``role`` is ``subject``, ``object`` or ``qualifier``, the place a term naming it by
+    ``ref`` takes. Its entity is the one ``entity`` names, else the one its ``identifiers`` name (through curated
+    schemes), else a new one."""
+
+    ref: str
+    role: str
+    span: Span | None = None
+    words: str | None = None
+    entity: str | None = None
+    identifiers: tuple[Identifier, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (self.span is None) == (self.words is None):
+            raise ValueError("a mention is a span or words, exactly one")
+        if self.entity is not None and self.identifiers:
+            raise ValueError("a mention names its entity by id or by identifiers, not both")
+
+    def wire(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"ref": self.ref, "role": self.role}
+        if self.span is not None:
+            body["span"] = self.span.wire()
+        if self.words is not None:
+            body["words"] = self.words
+        if self.entity is not None:
+            body["entity"] = self.entity
+        if self.identifiers:
+            body["identifiers"] = [identifier.wire() for identifier in self.identifiers]
+        return body
+
+
+@dataclass(frozen=True)
+class MentionRef:
+    """A term naming one of the statement's mentions by its ``ref``."""
+
+    mention: str
+
+    def wire(self) -> dict[str, Any]:
+        return {"mention": self.mention}
+
+
+@dataclass(frozen=True)
+class NamedTerm:
+    """A curated term in force, by its sort (``role`` or ``kind``) and name, such as the role ``producer``."""
+
+    sort: str
+    name: str
+
+    def wire(self) -> dict[str, Any]:
+        return {"term": {"sort": self.sort, "name": self.name}}
+
+
+@dataclass(frozen=True)
+class TypedValue:
+    """A typed value with the curated kind it is of, when known: a :class:`ValueTerm` and a kind's name."""
+
+    value: ValueTerm
+    kind: str | None = None
+
+    def wire(self) -> dict[str, Any]:
+        body = self.value.wire()
+        if self.kind is not None:
+            body["value"]["kind"] = self.kind
+        return body
+
+
+#: A subject: a mention, an entity by id, or a curated term. An object or a qualifier's value may also be a value.
+ReaderTerm = MentionRef | EntityTerm | NamedTerm | ValueTerm | TypedValue
+
+
+def _reader_term(term: ReaderTerm) -> dict[str, Any]:
+    if isinstance(term, EntityTerm) and term.identifiers:
+        # In this call identifiers belong to a mention, which keeps the words they were read from.
+        raise ValueError("a reader statement names an entity by id here; give identifiers on a mention")
+    return term.wire()
+
+
+@dataclass(frozen=True)
+class DocumentClaimant:
+    """The kept document itself makes the statement: the page's own voice."""
+
+    def wire(self) -> dict[str, Any]:
+        return {"kind": "source_document"}
+
+
+@dataclass(frozen=True)
+class MentionClaimant:
+    """Someone the document names makes the statement (contract 1.4): ``mention`` is the ref of the statement's
+    mention of role ``claimant``, the words naming them, which in a world statement is a span."""
+
+    mention: str
+
+    def wire(self) -> dict[str, Any]:
+        return {"kind": "mention", "mention": self.mention}
+
+
+@dataclass(frozen=True)
+class UnnamedClaimant:
+    """Someone the document does not name makes the statement (contract 1.4): "is considered", "it is said". The
+    service mints an entity for each such statement: nothing says two unnamed speakers are one."""
+
+    def wire(self) -> dict[str, Any]:
+        return {"kind": "unnamed"}
+
+
+@dataclass(frozen=True)
+class SpeakerClaimant:
+    """The speaker of the aired line the tell reads makes the statement (contract 1.5): the tell's ``source_event`` is
+    a world utterance and ``document`` its kept words. The service fills in who spoke, when, on which venue and for
+    whom, from the utterance, so the statement gives no ``said_at``. On an aired line the speaker is the outer voice
+    a chain of relays ends at, as the document is on a page."""
+
+    def wire(self) -> dict[str, Any]:
+        return {"kind": "speaker"}
+
+
+#: Who makes a reader statement. A claimant other than the document or the speaker is relayed: a
+#: :class:`ReaderRelay` of the same tell is about the statement.
+Claimant = DocumentClaimant | MentionClaimant | UnnamedClaimant | SpeakerClaimant
+
+
+@dataclass(frozen=True)
+class ReaderQualifier:
+    """A qualifier: a curated relation the statement's relation takes, by name, and its value."""
+
+    relation: str
+    value: ReaderTerm
+
+    def wire(self) -> dict[str, Any]:
+        return {"relation": self.relation, "value": _reader_term(self.value)}
+
+
+@dataclass(frozen=True)
+class ReaderStatement:
+    """One statement a reader read from a kept document, as ``POST /tell/statements`` takes it.
+
+    A ``world`` statement quotes: ``relation`` and every qualifier's relation are curated relations in force, and the
+    excerpt and every mention are spans. A ``product`` statement may name this product's declared relation or give
+    ``relation_literal``, its own phrase, use mentions given as words, and set ``world_requested``. The claimant is
+    the document itself unless ``claimant`` says otherwise (contract 1.4), and then a :class:`ReaderRelay` of the same
+    tell must be about this statement. ``excerpt_text``, when given, must be the excerpt's words, which the service
+    copies anyway. ``stance`` is ``asserts`` or ``denies``: a statement that reports is a :class:`ReaderRelay`.
+    """
+
+    audience: str
+    excerpt: Span
+    subject: ReaderTerm
+    object: ReaderTerm
+    relation: str | None = None
+    relation_literal: str | None = None
+    qualifiers: tuple[ReaderQualifier, ...] = ()
+    mentions: tuple[Mention, ...] = ()
+    stance: str = "asserts"
+    excerpt_text: str | None = None
+    said_at: datetime | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    world_requested: bool = False
+    claimant: Claimant = DocumentClaimant()
+
+    def __post_init__(self) -> None:
+        if (self.relation is None) == (self.relation_literal is None):
+            raise ValueError("a statement names a relation or a relation literal, exactly one")
+
+    def wire(self) -> dict[str, Any]:
+        excerpt = self.excerpt.wire()
+        if self.excerpt_text is not None:
+            excerpt["text"] = self.excerpt_text
+        proposition: dict[str, Any] = {"subject": _reader_term(self.subject), "object": _reader_term(self.object)}
+        if self.relation is not None:
+            proposition["relation"] = self.relation
+        else:
+            proposition["relation_literal"] = self.relation_literal
+        proposition["qualifiers"] = [qualifier.wire() for qualifier in self.qualifiers]
+        body: dict[str, Any] = {
+            "audience": self.audience,
+            "claimant": self.claimant.wire(),
+            "stance": self.stance,
+            "said_at": None if self.said_at is None else wire_time(self.said_at),
+            "excerpt": excerpt,
+            "mentions": [mention.wire() for mention in self.mentions],
+            "proposition": proposition,
+        }
+        if self.world_requested:
+            body["world_requested"] = True
+        if self.valid_from is not None or self.valid_to is not None:
+            body["valid"] = {
+                "from": None if self.valid_from is None else wire_time(self.valid_from),
+                "to": None if self.valid_to is None else wire_time(self.valid_to),
+            }
+        return body
+
+
+@dataclass(frozen=True)
+class ReaderRelay:
+    """A statement that ``reports`` another statement of the same tell (contract 1.4): "the magazine reports that the
+    legend says X" is the legend's statement of X and this relay of it, never X in the magazine's voice.
+
+    ``relays`` is the index in the tell of the statement it is about, which comes before it and whose claimant is not
+    the document. Its excerpt is the words that attribute (``the legend says``); its only mention is its claimant's,
+    when that is a :class:`MentionClaimant`. A world relay is about a world statement. It has no proposition, no valid
+    time and no request for the world.
+    """
+
+    audience: str
+    excerpt: Span
+    relays: int
+    claimant: Claimant = DocumentClaimant()
+    mentions: tuple[Mention, ...] = ()
+    excerpt_text: str | None = None
+    said_at: datetime | None = None
+
+    def wire(self) -> dict[str, Any]:
+        excerpt = self.excerpt.wire()
+        if self.excerpt_text is not None:
+            excerpt["text"] = self.excerpt_text
+        body: dict[str, Any] = {
+            "audience": self.audience,
+            "claimant": self.claimant.wire(),
+            "stance": "reports",
+            "said_at": None if self.said_at is None else wire_time(self.said_at),
+            "excerpt": excerpt,
+            "mentions": [mention.wire() for mention in self.mentions],
+            "relays": {"statement": {"index": self.relays}},
+        }
+        return body
+
+
+@dataclass(frozen=True)
+class MentionResolved:
+    """The entity a mention resolved to: ``given`` by its id, ``identifier`` when an identifier found it, or
+    ``minted``."""
+
+    ref: str
+    entity: str
+    resolved_by: str
+
+
+@dataclass(frozen=True)
+class ReaderStatementTold:
+    """One kept reader statement, at ``index`` in the tell, with its proposition and each mention's entity. A relay
+    has no proposition and names at ``relays`` the statement it is about; ``claimant`` is the claimant's entity when
+    it is not the document (contract 1.4), the speaker's among them."""
+
+    index: int
+    statement: str
+    proposition: str | None
+    mentions: tuple[MentionResolved, ...]
+    relays: str | None = None
+    claimant: str | None = None
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "ReaderStatementTold":
+        return cls(
+            index=_int(body, "index"),
+            statement=_str(body, "statement"),
+            proposition=_str(body, "proposition", nullable=True),
+            mentions=tuple(
+                MentionResolved(_str(item, "ref"), _str(item, "entity"), _str(item, "resolved_by"))
+                for item in _list(body, "mentions")
+            ),
+            relays=_str(body, "relays", optional=True),
+            claimant=_str(body, "claimant", optional=True),
+        )
+
+
+@dataclass(frozen=True)
+class StatementsTold:
+    """Kept reader statements, in the order told. ``statements`` is None only on a replay whose first answer was
+    cleared, as for :class:`FetchTold`."""
+
+    statements: tuple[ReaderStatementTold, ...] | None
+    replayed: bool
+    stamp: Stamp
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "StatementsTold":
+        replayed = _bool(body, "replayed", optional=True, default=False)
+        cleared = isinstance(body, dict) and "statements" not in body and replayed is True
+        return cls(
+            statements=None if cleared else tuple(ReaderStatementTold.read(item) for item in _list(body, "statements")),
+            replayed=replayed,
+            stamp=Stamp.read(_object(body, "stamp")),
+        )
+
+
 # --- Look-ups -----------------------------------------------------------------------------------------------------
 
 
@@ -634,7 +950,8 @@ class Witness:
 
 @dataclass(frozen=True)
 class MyFetch:
-    """One of this product's own fetch requests, with its exact time, and its witness once the day's batch ran."""
+    """One of this product's own fetch requests, with its exact time, and its witness: written with the request when
+    it read the page, and none when it did not."""
 
     request: str
     url_requested: str
@@ -721,3 +1038,120 @@ class KeptDocument:
     text: str
     mime_type: str | None
     stamp: Stamp
+
+
+# --- Curation ------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CurationTerm:
+    """A curated term the files declare: its ``sort`` (``relation``, ``role``, ``kind``, ``scheme`` or ``mapping``), its
+    name, and the SHA-256, in hex, of its meaning line (a mapping's: of its file). The meaning line itself is never
+    sent. A scheme takes the two flags and the kinds it identifies as ``subject``; a relation takes the kinds of its
+    ``subject`` and ``object`` and the relations it allows as ``qualifiers``."""
+
+    sort: str
+    name: str
+    digest: str
+    names_one: bool = False
+    one_each: bool = False
+    subject: tuple[str, ...] = ()
+    object: tuple[str, ...] = ()
+    qualifiers: tuple[str, ...] = ()
+
+    def wire(self) -> dict[str, Any]:
+        return {
+            "sort": self.sort,
+            "name": self.name,
+            "digest": self.digest,
+            "names_one": self.names_one,
+            "one_each": self.one_each,
+            "subject": list(self.subject),
+            "object": list(self.object),
+            "qualifiers": list(self.qualifiers),
+        }
+
+
+@dataclass(frozen=True)
+class CurationToken:
+    """A source's token in a curated token scheme, mapped to the ``role`` or ``kind`` ``maps_to`` names as
+    ``(sort, name)``, or to none when it is known and not yet mapped."""
+
+    scheme: str
+    token: str
+    maps_to: tuple[str, str] | None = None
+
+    def wire(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"scheme": self.scheme, "token": self.token, "maps_to": None}
+        if self.maps_to is not None:
+            body["maps_to"] = {"sort": self.maps_to[0], "name": self.maps_to[1]}
+        return body
+
+
+@dataclass(frozen=True)
+class CurationChange:
+    """One term or token a load wrote: a term by ``sort`` and ``name``, a token by ``scheme`` and ``token`` (and, once
+    mapped, the ``maps_to`` it was mapped to)."""
+
+    sort: str | None = None
+    name: str | None = None
+    scheme: str | None = None
+    token: str | None = None
+    maps_to: tuple[str, str] | None = None
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "CurationChange":
+        target = _object(body, "maps_to", nullable=True) if "maps_to" in body else None
+        return cls(
+            sort=_str(body, "sort", nullable=True, optional=True),
+            name=_str(body, "name", nullable=True, optional=True),
+            scheme=_str(body, "scheme", nullable=True, optional=True),
+            token=_str(body, "token", nullable=True, optional=True),
+            maps_to=None if target is None else (_str(target, "sort"), _str(target, "name")),
+        )
+
+
+@dataclass(frozen=True)
+class CurationLoaded:
+    """What a curation load did. ``unchanged`` is true when the files held nothing the vocabulary in force did not:
+    nothing was written and ``reader`` is None. Otherwise ``statements`` were appended, read by ``reader``."""
+
+    unchanged: bool
+    digest: str
+    reader: str | None
+    statements: int
+    declared: tuple[CurationChange, ...]
+    changed: tuple[CurationChange, ...]
+    withdrawn: tuple[CurationChange, ...]
+    terms_unchanged: int
+    claimed: tuple[CurationChange, ...]
+    mapped: tuple[CurationChange, ...]
+    remapped: tuple[CurationChange, ...]
+    unmapped: tuple[CurationChange, ...]
+    tokens_unchanged: int
+    stamp: Stamp
+
+    @classmethod
+    def read(cls, body: dict[str, Any]) -> "CurationLoaded":
+        terms = _object(body, "terms")
+        tokens = _object(body, "tokens")
+
+        def changes(parent: dict[str, Any], name: str) -> tuple[CurationChange, ...]:
+            return tuple(CurationChange.read(item) for item in _list(parent, name))
+
+        return cls(
+            unchanged=_bool(body, "unchanged"),
+            digest=_str(body, "digest"),
+            reader=_str(body, "reader", nullable=True),
+            statements=_int(body, "statements"),
+            declared=changes(terms, "declared"),
+            changed=changes(terms, "changed"),
+            withdrawn=changes(terms, "withdrawn"),
+            terms_unchanged=_int(terms, "unchanged"),
+            claimed=changes(tokens, "claimed"),
+            mapped=changes(tokens, "mapped"),
+            remapped=changes(tokens, "remapped"),
+            unmapped=changes(tokens, "unmapped"),
+            tokens_unchanged=_int(tokens, "unchanged"),
+            stamp=Stamp.read(_object(body, "stamp")),
+        )

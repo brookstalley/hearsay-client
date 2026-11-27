@@ -24,8 +24,12 @@ from typing import Any, Self, TypeVar
 
 import httpx
 
+from hearsay_client.lookup import LookedUp, Lookup
 from hearsay_client.types import (
     AboutTold,
+    CurationLoaded,
+    CurationTerm,
+    CurationToken,
     Fetch,
     FetchTold,
     Handshake,
@@ -33,6 +37,8 @@ from hearsay_client.types import (
     Misshapen,
     MyFetch,
     Reader,
+    ReaderRelay,
+    ReaderStatement,
     RelationDeclared,
     Relations,
     Search,
@@ -41,6 +47,7 @@ from hearsay_client.types import (
     SeenSearch,
     ServedContract,
     Stamp,
+    StatementsTold,
     UrlSeen,
     Utterance,
     UtteranceTold,
@@ -59,7 +66,7 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 #: The contract version this client is built against. It is sent on every call but the handshake.
-CONTRACT_VERSION = "1.1"
+CONTRACT_VERSION = "1.5"
 
 CONTRACT_HEADER = "Hearsay-Contract"
 IDEMPOTENCY_HEADER = "Idempotency-Key"
@@ -340,6 +347,23 @@ class HearsayClient:
         answer = await self._request("GET", "/relations", params=params)
         return _shaped("GET /relations", answer, Relations.read)
 
+    # --- Curation --------------------------------------------------------------------------------------------------
+
+    async def load_curation(
+        self, digest: str, terms: Sequence[CurationTerm], tokens: Sequence[CurationToken] = ()
+    ) -> CurationLoaded:
+        """Load the curation files' vocabulary (operator key only): every term and token the files declare, each meaning
+        line as its SHA-256, and ``digest``, the files' own (``sha256:`` and 64 hex digits), which the loader's reader
+        takes as its version. What the files no longer hold is withdrawn, so a load is the whole of the curation. A
+        load changing nothing writes nothing and answers ``unchanged``; the call is idempotent, so a retry is safe."""
+        body = {
+            "digest": digest,
+            "terms": [term.wire() for term in terms],
+            "tokens": [token.wire() for token in tokens],
+        }
+        answer = await self._request("POST", "/curation/load", json=body)
+        return _shaped("POST /curation/load", answer, CurationLoaded.read)
+
     # --- Utterances ------------------------------------------------------------------------------------------------
 
     async def tell_utterance(self, utterance: Utterance, *, idempotency_key: str | None = None) -> UtteranceTold:
@@ -397,6 +421,50 @@ class HearsayClient:
         answer = await self._tell("/tell/witnessed", body, idempotency_key)
         return _shaped("POST /tell/witnessed", answer, WitnessedTold.read)
 
+    async def tell_statements(
+        self,
+        statements: Sequence[ReaderStatement | ReaderRelay],
+        *,
+        reader: str,
+        source_event: str,
+        document: str,
+        idempotency_key: str | None = None,
+    ) -> StatementsTold:
+        """Keep statements one of this product's readers read from one kept document, 1 to 200: all of them, or none
+        when one is refused. ``source_event`` is the document's fetch witness (``st_…``) and ``document`` its
+        ``doc_…`` id. An importer reader needs an operator's key. A retry with the same key stores nothing again.
+        A relay names the statement it reports by its index in ``statements`` (contract 1.4). An aired line is read
+        with ``source_event`` its world utterance (``st_…``), in the speaker's voice (:class:`SpeakerClaimant`,
+        contract 1.5)."""
+        return await self.tell_statement_bodies(
+            [statement.wire() for statement in statements],
+            reader=reader,
+            source_event=source_event,
+            document=document,
+            idempotency_key=idempotency_key,
+        )
+
+    async def tell_statement_bodies(
+        self,
+        statements: Sequence[Mapping[str, Any]],
+        *,
+        reader: str,
+        source_event: str,
+        document: str,
+        idempotency_key: str | None = None,
+    ) -> StatementsTold:
+        """:meth:`tell_statements` for statements already in the contract's wire form, each the body
+        ``ReaderStatement.wire()`` gives, sent as given: for a reader that builds the wire form itself, such as a
+        mapping's interpreter. Nothing is checked here that the service does not check again."""
+        body = {
+            "reader": reader,
+            "source_event": source_event,
+            "document": document,
+            "statements": [dict(statement) for statement in statements],
+        }
+        answer = await self._tell("/tell/statements", body, idempotency_key)
+        return _shaped("POST /tell/statements", answer, StatementsTold.read)
+
     async def _tell(self, path: str, body: dict[str, Any], idempotency_key: str | None) -> _Answer:
         # One key for every attempt, so a retry after a lost answer is replayed rather than written twice.
         key = idempotency_key or str(uuid.uuid4())
@@ -420,6 +488,27 @@ class HearsayClient:
                 stamp=Stamp.read(_object(body, "stamp")),
             ),
         )
+
+    async def lookup(
+        self,
+        lookup: Lookup,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        min_store_state: int | None = None,
+        on_behind: str | None = None,
+    ) -> LookedUp:
+        """A structured query, answered under no policy (contract 1.3, experimental): from an entity or a typed
+        identifier, along curated relations, the entities reached with the statements behind each. What comes back is
+        what was said, never a verdict: read ``complete`` and ``cuts`` before treating the answers as all there are.
+
+        A further page is the same look-up with the ``next_cursor`` the page before returned; the cursor pins the
+        store state, and is refused (``cursor_invalid``) with another look-up or after ten minutes."""
+        body = _read(lookup.wire(), limit, min_store_state, on_behind)
+        if cursor is not None:
+            body["cursor"] = cursor
+        answer = await self._request("POST", "/lookup", json=body)
+        return _shaped("POST /lookup", answer, LookedUp.read)
 
     async def lookup_search(
         self,
